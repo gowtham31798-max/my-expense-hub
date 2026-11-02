@@ -1,0 +1,165 @@
+rules_version = '2';
+
+// Family Spend Hub — Firestore security rules
+// Who can do what:
+//   • Owner: everything in their household, can read every member's expenses, approves/removes members.
+//   • Member: own expenses only (read/write), shared lists (read/write), member names (read).
+//   • Everyone: savings, loans, charges, cards and preferences are private to the person who adds them.
+//   • Anyone else: can only create an access request or accept an invite addressed to their Google email.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function hhPath(hid) { return /databases/$(database)/documents/households/$(hid); }
+    function memberPath(hid, uid) { return /databases/$(database)/documents/households/$(hid)/members/$(uid); }
+    function isMember(hid) { return signedIn() && exists(memberPath(hid, request.auth.uid)); }
+    function isOwner(hid) { return signedIn() && get(hhPath(hid)).data.ownerUid == request.auth.uid; }
+
+    // ---------- users/{uid}: which household this account belongs to ----------
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['householdId', 'updatedAt'])
+        && (request.resource.data.householdId == null
+            || existsAfter(memberPath(request.resource.data.householdId, uid)));
+      allow delete: if signedIn() && request.auth.uid == uid;
+
+      // ----- private data: credit cards, savings, loans, charges, preferences -----
+      // Only the account holder can read or write these. Not even the household owner can see them.
+      match /{coll}/{docId} {
+        allow read, delete: if signedIn() && request.auth.uid == uid
+          && coll in ['cards', 'savings', 'loans', 'charges', 'prefs'];
+        allow create, update: if signedIn() && request.auth.uid == uid
+          && coll in ['cards', 'savings', 'loans', 'charges', 'prefs']
+          && request.resource.data.size() <= 40
+          && (!('payments' in request.resource.data) || (request.resource.data.payments is list && request.resource.data.payments.size() <= 600))
+          && (!('name' in request.resource.data) || (request.resource.data.name is string && request.resource.data.name.size() <= 120));
+      }
+    }
+
+    // ---------- invites/{email}: owner pre-approves a Google email ----------
+    match /invites/{email} {
+      allow read: if signedIn() && (myEmail() == email || resource.data.ownerUid == request.auth.uid);
+      allow create: if signedIn()
+        && email == email.lower()
+        && request.resource.data.email == email
+        && request.resource.data.ownerUid == request.auth.uid
+        && isOwner(request.resource.data.householdId)
+        && request.resource.data.keys().hasOnly(['email', 'householdId', 'householdName', 'ownerUid', 'ownerName', 'invitedAt']);
+      allow update: if false;
+      allow delete: if signedIn() && (myEmail() == email || resource.data.ownerUid == request.auth.uid);
+    }
+
+    // ---------- households/{hid} ----------
+    match /households/{hid} {
+      // Household ids are random; anyone holding a join link may read the name to request access.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'ownerUid', 'ownerEmail', 'ownerName', 'monthlyBudget', 'createdAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && existsAfter(memberPath(hid, request.auth.uid));
+      allow update: if isOwner(hid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'monthlyBudget'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && request.resource.data.monthlyBudget is number && request.resource.data.monthlyBudget >= 0;
+      allow delete: if false;
+
+      // ----- members -----
+      match /members/{uid} {
+        function validMember() {
+          let d = request.resource.data;
+          return d.keys().hasOnly(['uid', 'email', 'name', 'photo', 'role', 'joinedAt', 'budget'])
+            && d.uid == uid && d.name is string && d.name.size() <= 80;
+        }
+        allow get: if signedIn() && (request.auth.uid == uid || isMember(hid));
+        allow list: if isMember(hid);
+        allow create: if signedIn() && validMember() && (
+          // 1. owner bootstraps the household (same batch as the household doc)
+          (request.auth.uid == uid && request.resource.data.role == 'owner'
+             && getAfter(hhPath(hid)).data.ownerUid == uid)
+          // 2. invited person accepts an invite addressed to their email
+          || (request.auth.uid == uid && request.resource.data.role == 'member'
+             && request.resource.data.email.lower() == myEmail()
+             && exists(/databases/$(database)/documents/invites/$(myEmail()))
+             && get(/databases/$(database)/documents/invites/$(myEmail())).data.householdId == hid)
+          // 3. owner approves a pending access request
+          || (isOwner(hid) && request.resource.data.role == 'member'
+             && exists(/databases/$(database)/documents/households/$(hid)/requests/$(uid)))
+        );
+        allow update: if signedIn() && request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'photo', 'budget']);
+        allow delete: if signedIn() && (
+          (isOwner(hid) && uid != request.auth.uid)              // owner removes a member
+          || (request.auth.uid == uid && resource.data.role != 'owner')  // member leaves
+        );
+      }
+
+      // ----- access requests -----
+      match /requests/{uid} {
+        allow get: if signedIn() && (request.auth.uid == uid || isOwner(hid));
+        allow list: if isOwner(hid);
+        allow create, update: if signedIn() && request.auth.uid == uid
+          && exists(hhPath(hid))
+          && !isMember(hid)
+          && request.resource.data.keys().hasOnly(['uid', 'email', 'name', 'photo', 'requestedAt'])
+          && request.resource.data.uid == uid
+          && request.resource.data.email.lower() == myEmail();
+        allow delete: if signedIn() && (request.auth.uid == uid || isOwner(hid));
+      }
+
+      // ----- expenses: private to the creator, visible to the owner -----
+      match /expenses/{eid} {
+        function validExpense() {
+          let d = request.resource.data;
+          return d.keys().hasOnly(['uid', 'memberName', 'amount', 'category', 'merchant', 'mode', 'date', 'createdAt', 'source', 'cardId', 'cardName', 'bank'])
+            && (!('bank' in d) || (d.bank is string && d.bank.size() <= 40))
+            && (!('cardId' in d) || (d.cardId is string && d.cardId.size() <= 40))
+            && (!('cardName' in d) || (d.cardName is string && d.cardName.size() <= 60))
+            && d.uid == request.auth.uid
+            && d.amount is number && d.amount > 0 && d.amount < 10000000
+            && d.category is string && d.category.size() <= 40
+            && d.merchant is string && d.merchant.size() <= 120
+            && d.mode is string && d.mode.size() <= 40
+            && d.date is timestamp;
+        }
+        allow read: if isMember(hid) && (resource.data.uid == request.auth.uid || isOwner(hid));
+        allow create: if isMember(hid) && validExpense();
+        allow update: if isMember(hid) && resource.data.uid == request.auth.uid && validExpense();
+        allow delete: if isMember(hid) && resource.data.uid == request.auth.uid;
+      }
+
+      // ----- daily gold rates, shared by the household (one fetch serves everyone) -----
+      match /goldRates/{day} {
+        allow read: if isMember(hid);
+        allow create, update: if isMember(hid)
+          && request.resource.data.keys().hasOnly(['date', 'rate', 'rate8', 'silver', 'platinum', 'trend', 'jewellerUpdated', 'premium', 'source', 'fetchedAt'])
+          && request.resource.data.date == day
+          && request.resource.data.rate is number && request.resource.data.rate > 1000 && request.resource.data.rate < 100000;
+        allow delete: if false;
+      }
+
+      // ----- shared shopping / to-do lists -----
+      match /lists/{lid} {
+        allow read: if isMember(hid);
+        allow create, update: if isMember(hid)
+          && request.resource.data.keys().hasOnly(['name', 'createdBy', 'createdAt'])
+          && request.resource.data.name is string && request.resource.data.name.size() <= 60;
+        allow delete: if isMember(hid);
+
+        match /items/{iid} {
+          allow read: if isMember(hid);
+          allow create, update: if isMember(hid)
+            && request.resource.data.keys().hasOnly(['name', 'qty', 'status', 'note', 'addedBy', 'addedByName', 'createdAt', 'updatedBy', 'updatedByName', 'updatedAt'])
+            && request.resource.data.name is string && request.resource.data.name.size() <= 80
+            && request.resource.data.status in ['tobuy', 'got', 'na']
+            && request.resource.data.updatedBy == request.auth.uid;
+          allow delete: if isMember(hid);
+        }
+      }
+    }
+  }
+}
