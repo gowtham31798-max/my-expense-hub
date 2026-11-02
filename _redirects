@@ -1,0 +1,5 @@
+# Netlify forwards these requests server-side, so the browser isn't blocked by the other sites.
+/api/gold-rate                 https://lakshmanaacharison.com/api/method/klas_app.api.rate_update.get_metal_rates  200
+/api/mf/*                      https://api.mfapi.in/mf/:splat  200
+# Android app (APK) verification file from PWABuilder; upload it as assetlinks.json next to index.html
+/.well-known/assetlinks.json   /assetlinks.json  200
